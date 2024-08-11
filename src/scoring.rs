@@ -32,7 +32,7 @@ pub struct Scoring {
     pub receiving_td_50yd_bonus: f64,
 
     pub fumble_recovery_td_points: f64,
-    pub kick_punt_return_td_points: f64,
+    pub return_td_points: f64,
 
     pub interception_points: f64,
     pub fumble_lost_points: f64,
@@ -68,7 +68,7 @@ impl Scoring {
             receiving_200yd_bonus: 0.0,
             receiving_td_50yd_bonus: 0.0,
             fumble_recovery_td_points: 6.0,
-            kick_punt_return_td_points: 6.0,
+            return_td_points: 6.0,
             fg_made_40yd_bonus: 0.0,
             fg_made_50yd_bonus: 0.0,
         }
@@ -87,86 +87,119 @@ impl Scoring {
     }
 }
 
+static PASSING_QUERY: &str = r#"
+    SELECT 
+        posteam as team,
+        passer_player_id as player_id,
+        passer_player_name as player_name,
+        SUM(passing_yards) as passing_yards,
+        SUM(pass_touchdown) as pass_touchdowns,
+        SUM(interception) as interceptions,
+        SUM(CASE WHEN passing_yards > 50 THEN pass_touchdown ELSE 0 END) as passing_50yd_td
+    FROM plays
+    WHERE passer_player_name IS NOT NULL
+    GROUP BY posteam, passer_player_id, passer_player_name
+"#;
+
+static RECEIVING_QUERY: &str = r#"
+    SELECT 
+        posteam as team,
+        receiver_player_id as player_id,
+        receiver_player_name as player_name,
+        SUM(complete_pass) as receptions,
+        SUM(receiving_yards) as receiving_yards,
+        SUM(pass_touchdown) as receiving_touchdowns,
+        SUM(CASE WHEN two_point_conv_result = 'success' THEN 1 ELSE 0 END) as two_pt_conv_made,
+        SUM(CASE WHEN receiving_yards > 50 THEN pass_touchdown ELSE 0 END) as receiving_50yd_td
+    FROM plays
+    WHERE receiver_player_name IS NOT NULL
+    GROUP BY posteam, receiver_player_id, receiver_player_name
+"#;
+
+static RUSHING_QUERY: &str = r#"
+    SELECT 
+        posteam as team,
+        rusher_player_id as player_id,
+        rusher_player_name as player_name,
+        SUM(rushing_yards) as rushing_yards,
+        SUM(rush_touchdown) as rush_touchdowns,
+        SUM(CASE WHEN two_point_conv_result = 'success' THEN 1 ELSE 0 END) as two_pt_conv_made,
+        SUM(CASE WHEN rushing_yards > 50 THEN rush_touchdown ELSE 0 END) as rushing_50yd_td
+    FROM plays
+    WHERE rusher_player_name IS NOT NULL
+    GROUP BY posteam, rusher_player_id, rusher_player_name
+"#;
+
+static FUMBLING_QUERY: &str = r#"
+    SELECT 
+        posteam as team,
+        fumbled_1_player_id as player_id,
+        fumbled_1_player_name as player_name,
+        SUM(fumble_lost) as fumbles_lost
+    FROM plays
+    WHERE fumbled_1_player_name IS NOT NULL
+    GROUP BY posteam, fumbled_1_player_id, fumbled_1_player_name
+"#;
+
+static KICKING_QUERY: &str = r#"
+    SELECT 
+        posteam as team,
+        kicker_player_id as player_id,
+        kicker_player_name as player_name,
+        SUM(CASE WHEN extra_point_result = 'good' THEN 1 ELSE 0 END) as pat_made,
+        SUM(CASE WHEN field_goal_result = 'made' THEN 1 ELSE 0 END) as fg_made,
+        SUM(CASE WHEN kick_distance >= 40 AND field_goal_result = 'made' THEN 1 ELSE 0 END) as fg_40plus_made,
+        SUM(CASE WHEN kick_distance >= 50 AND field_goal_result = 'made' THEN 1 ELSE 0 END) as fg_50plus_made
+    FROM plays
+    WHERE play_type != 'kickoff' AND kicker_player_name IS NOT NULL
+    GROUP BY posteam, kicker_player_id, kicker_player_name
+"#;
+
+static RETURNING_QUERY: &str = r#"
+    SELECT 
+        team,
+        player_id,
+        player_name,
+        SUM(return_touchdown) as td_returns
+    FROM (
+        SELECT 
+            posteam as team,
+            COALESCE(
+                lateral_kickoff_returner_player_id, 
+                lateral_punt_returner_player_id, 
+                kickoff_returner_player_id, 
+                punt_returner_player_id
+            ) as player_id,
+            COALESCE(
+                lateral_kickoff_returner_player_name, 
+                lateral_punt_returner_player_name, 
+                kickoff_returner_player_name, 
+                punt_returner_player_name
+            ) as player_name,
+            return_touchdown
+        FROM plays
+        WHERE return_touchdown = 1.0
+    ) as coalesced_players
+    GROUP BY team, player_id, player_name
+"#;
+
 pub fn fantasy_stats(df: DataFrame, scoring: Scoring) -> Result<DataFrame> {
-    // Initialize the SQL context
     let mut ctx = SQLContext::new();
     ctx.register("plays", df.lazy());
-    let passing_query = r#"
-        SELECT 
-            posteam as team,
-            passer_player_id as player_id,
-            passer_player_name as player_name,
-            SUM(passing_yards) as passing_yards,
-            SUM(pass_touchdown) as pass_touchdowns,
-            SUM(interception) as interceptions,
-            SUM(CASE WHEN passing_yards > 50 THEN pass_touchdown ELSE 0 END) as passing_50yd_td
-        FROM plays
-        WHERE passer_player_name IS NOT NULL
-        GROUP BY posteam, passer_player_id, passer_player_name
-    "#;
 
-    let receiving_query = r#"
-        SELECT 
-            posteam as team,
-            receiver_player_id as player_id,
-            receiver_player_name as player_name,
-            SUM(complete_pass) as receptions,
-            SUM(receiving_yards) as receiving_yards,
-            SUM(pass_touchdown) as receiving_touchdowns,
-            SUM(CASE WHEN receiving_yards > 50 THEN pass_touchdown ELSE 0 END) as receiving_50yd_td
-        FROM plays
-        WHERE receiver_player_name IS NOT NULL
-        GROUP BY posteam, receiver_player_id, receiver_player_name
-    "#;
 
-    let rushing_query = r#"
-        SELECT 
-            posteam as team,
-            rusher_player_id as player_id,
-            rusher_player_name as player_name,
-            SUM(rushing_yards) as rushing_yards,
-            SUM(rush_touchdown) as rush_touchdowns,
-            SUM(CASE WHEN rushing_yards > 50 THEN rush_touchdown ELSE 0 END) as rushing_50yd_td
-        FROM plays
-        WHERE rusher_player_name IS NOT NULL
-        GROUP BY posteam, rusher_player_id, rusher_player_name
-        "#;
-
-    let fumbling_query = r#"
-        SELECT 
-            posteam as team,
-            fumbled_1_player_id as player_id,
-            fumbled_1_player_name as player_name,
-            SUM(fumble_lost) as fumbles_lost
-        FROM plays
-        WHERE fumbled_1_player_name IS NOT NULL
-        GROUP BY posteam, fumbled_1_player_id, fumbled_1_player_name
-    "#;
-
-    let kicking_query = r#"
-        SELECT 
-            posteam as team,
-            kicker_player_id as player_id,
-            kicker_player_name as player_name,
-            SUM(field_goal_made) as fg_made,
-            SUM(extra_point_made) as pat_made,
-            SUM(CASE WHEN kick_distance >= 40 AND field_goal_made = 1 THEN 1 ELSE 0 END) as fg_40plus_made,
-            SUM(CASE WHEN kick_distance >= 50 AND field_goal_made = 1 THEN 1 ELSE 0 END) as fg_50plus_made
-        FROM plays
-        WHERE kicker_player_name IS NOT NULL
-        GROUP BY posteam, kicker_player_id, kicker_player_name
-    "#;
-
-    let passing_df = ctx.execute(passing_query)?.collect()?;
+    let passing_df = ctx.execute(PASSING_QUERY)?.collect()?;
     println!("{} passers with fantasy points", passing_df.height());
-    let receiving_df = ctx.execute(receiving_query)?.collect()?;
+    let receiving_df = ctx.execute(RECEIVING_QUERY)?.collect()?;
     println!("{} receivers with fantasy points", receiving_df.height());
-    let rushing_df = ctx.execute(rushing_query)?.collect()?;
+    let rushing_df = ctx.execute(RUSHING_QUERY)?.collect()?;
     println!("{} rushers with fantasy points", rushing_df.height());
-    let fumbling_df = ctx.execute(fumbling_query)?.collect()?;
+    let fumbling_df = ctx.execute(FUMBLING_QUERY)?.collect()?;
     println!("{} fumblers with fantasy points", fumbling_df.height());
-    let kicking_df = ctx.execute(kicking_query)?.collect()?;
+    let kicking_df = ctx.execute(KICKING_QUERY)?.collect()?;
     println!("{} kickers with fantasy points", kicking_df.height());
+    let returning_df = ctx.execute(RETURNING_QUERY)?.collect()?;
+    println!("{} returners with fantasy points", returning_df.height());
 
     // Merge the DataFrames on team, player_id, and player_name
     let join_cols = ["team", "player_id", "player_name"];
@@ -175,7 +208,9 @@ pub fn fantasy_stats(df: DataFrame, scoring: Scoring) -> Result<DataFrame> {
         .join(&receiving_df, join_cols, join_cols, join_args.clone())?
         .join(&rushing_df, join_cols, join_cols, join_args.clone())?
         .join(&passing_df, join_cols, join_cols, join_args.clone())?
-        .join(&kicking_df, join_cols, join_cols, join_args.clone())?;
+        .join(&kicking_df, join_cols, join_cols, join_args.clone())?
+        .join(&returning_df, join_cols, join_cols, join_args.clone())?
+        .join(&fumbling_df, join_cols, join_cols, join_args.clone())?;
     println!("{} total players with fantasy points", merged_df.height());
 
     // Perform fantasy point calculations
@@ -201,8 +236,14 @@ fn scoring_cols(scoring: Scoring) -> Expr {
         + col("receiving_touchdowns").fill_null(lit(0.0)) * lit(scoring.receiving_td_points)
         + col("interceptions").fill_null(lit(0.0)) * lit(scoring.interception_points)
         + col("fumbles_lost").fill_null(lit(0.0)) * lit(scoring.fumble_lost_points)
+        + col("fg_made").fill_null(lit(0.0)) * lit(scoring.fg_made_points)
+        + col("pat_made").fill_null(lit(0.0)) * lit(scoring.pat_made_points)
+        + col("td_returns").fill_null(lit(0.0)) * lit(scoring.return_td_points)
+        + col("two_pt_conv_made").fill_null(lit(0.0)) * lit(scoring.two_point_conversion_points)
+        // TODO: Figure out how to count fumble recovery TDs
 
-        // All the ccode below here is because my brother
+
+        // All the code below here is because my brother
         // couldn't just pick standard scoring when starting
         // a game with a bunch of family that hasn't played FF before.
         // A true jerk move. There, I said it.
@@ -231,4 +272,7 @@ fn scoring_cols(scoring: Scoring) -> Expr {
         + when(col("receiving_yards").gt(lit(200.0)))
             .then(lit(scoring.receiving_200yd_bonus))
             .otherwise(lit(0.0))
+        // Kicking bonuses
+        + col("fg_40plus_made").fill_null(lit(0.0)) * lit(scoring.fg_made_40yd_bonus)
+        + col("fg_50plus_made").fill_null(lit(0.0)) * lit(scoring.fg_made_50yd_bonus)
 }
