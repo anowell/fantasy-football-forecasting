@@ -1,10 +1,9 @@
 use anyhow::{bail, Result};
 use clap::Parser;
-use polars::{prelude::*, sql::SQLContext};
-use scoring::{fantasy_stats, Scoring};
-
-// mod play;
-mod scoring;
+use fff::{filter::Filter, scoring::score_game, scoring::Scoring};
+use log::LevelFilter;
+use polars::prelude::*;
+use simplelog::{ColorChoice, ConfigBuilder, TermLogger, TerminalMode};
 
 fn crazy_shawn_scoring() -> Scoring {
     let mut scoring = Scoring::ppr();
@@ -36,13 +35,37 @@ struct Args {
 
     #[arg(long, default_value = "ppr")]
     scoring: String,
+
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let mut file = std::fs::File::open(args.file)?;
-    let df = ParquetReader::new(&mut file).finish()?;
+    // Set the default level based on verbosity
+    let default_level = match args.verbose {
+        0 => LevelFilter::Warn,
+        1 => LevelFilter::Info,
+        2 => LevelFilter::Debug,
+        _ => LevelFilter::Trace,
+    };
+
+    let config = ConfigBuilder::new().add_filter_allow_str("fff::").build();
+
+    // Initialize the logger with the custom configuration
+    TermLogger::init(
+        default_level,
+        config,
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )
+    .unwrap();
+
+    log::trace!("Args {:#?}", args);
+
+    let df = fff::load_parquet(args.file)?;
+    log::info!("Loaded {} plays", df.height());
 
     let scoring = match &*args.scoring {
         "ppr" => Scoring::ppr(),
@@ -52,37 +75,15 @@ fn main() -> Result<()> {
         _ => bail!("Unsupported scoring. Use: ppr, half-ppr, no-ppr, or shawn"),
     };
 
-    let game_df = filter_game(df, args.week, &args.team)?;
-    let fantasy_stats = fantasy_stats(game_df, scoring)?;
+    let filter = Filter::new().week(args.week).team(&args.team).build();
+    let game_df = df.lazy().filter(filter).collect()?;
+    let fantasy_stats = score_game(game_df, scoring)?;
 
     let simple = fantasy_stats
         .lazy()
         .select([cols(["team", "player_id", "player_name", "fantasy_points"])])
         .collect()?;
     println!("{}", simple);
-    // for stats in fantasy_stats.i {
-    //     println!("{:?}", stats);
-    // }
 
     Ok(())
-}
-
-pub fn filter_game(df: DataFrame, week: i32, team: &str) -> Result<DataFrame> {
-    let mut ctx = SQLContext::new();
-    ctx.register("plays", df.lazy());
-
-    // SQL query to aggregate stats by player
-    let query = format!(
-        r#"
-        SELECT *
-        FROM plays
-        WHERE week = {} AND posteam = '{}'
-    "#,
-        week, team
-    );
-
-    // Execute the query
-    let fdf = ctx.execute(&query)?.collect()?;
-    println!("{} week {}: {} plays", team, week, fdf.height());
-    Ok(fdf)
 }

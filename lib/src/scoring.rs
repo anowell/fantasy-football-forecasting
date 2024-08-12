@@ -1,4 +1,5 @@
-use anyhow::Result;
+use crate::error::Error;
+use crate::Result;
 use polars::prelude::*;
 use polars::sql::SQLContext;
 
@@ -183,23 +184,48 @@ static RETURNING_QUERY: &str = r#"
     GROUP BY team, player_id, player_name
 "#;
 
-pub fn fantasy_stats(df: DataFrame, scoring: Scoring) -> Result<DataFrame> {
+pub fn assert_single_game_id(df: &DataFrame) -> Result<()> {
+    // Get the unique values in the `game_id` column
+    let unique_game_ids = df
+        .column("game_id")
+        .unwrap()
+        // .utf8()
+        // .unwrap()
+        .unique()
+        .unwrap();
+
+    // Check the number of unique values
+    let unique_count = unique_game_ids.len();
+
+    if unique_count == 1 {
+        // If exactly one unique value is found, return Ok
+        Ok(())
+    } else {
+        // Otherwise, return an Err with the found game_ids
+        let game_ids: Vec<String> = unique_game_ids.iter().map(|s| s.to_string()).collect();
+        Err(Error::NotASingleGame(game_ids))
+    }
+}
+
+pub fn score_game(df: DataFrame, scoring: Scoring) -> Result<DataFrame> {
+    // Scoring math runs on a single game
+    assert_single_game_id(&df)?;
+
     let mut ctx = SQLContext::new();
     ctx.register("plays", df.lazy());
 
-
     let passing_df = ctx.execute(PASSING_QUERY)?.collect()?;
-    println!("{} passers with fantasy points", passing_df.height());
+    log::debug!("{} passers with fantasy points", passing_df.height());
     let receiving_df = ctx.execute(RECEIVING_QUERY)?.collect()?;
-    println!("{} receivers with fantasy points", receiving_df.height());
+    log::debug!("{} receivers with fantasy points", receiving_df.height());
     let rushing_df = ctx.execute(RUSHING_QUERY)?.collect()?;
-    println!("{} rushers with fantasy points", rushing_df.height());
+    log::debug!("{} rushers with fantasy points", rushing_df.height());
     let fumbling_df = ctx.execute(FUMBLING_QUERY)?.collect()?;
-    println!("{} fumblers with fantasy points", fumbling_df.height());
+    log::debug!("{} fumblers with fantasy points", fumbling_df.height());
     let kicking_df = ctx.execute(KICKING_QUERY)?.collect()?;
-    println!("{} kickers with fantasy points", kicking_df.height());
+    log::debug!("{} kickers with fantasy points", kicking_df.height());
     let returning_df = ctx.execute(RETURNING_QUERY)?.collect()?;
-    println!("{} returners with fantasy points", returning_df.height());
+    log::debug!("{} returners with fantasy points", returning_df.height());
 
     // Merge the DataFrames on team, player_id, and player_name
     let join_cols = ["team", "player_id", "player_name"];
@@ -211,7 +237,7 @@ pub fn fantasy_stats(df: DataFrame, scoring: Scoring) -> Result<DataFrame> {
         .join(&kicking_df, join_cols, join_cols, join_args.clone())?
         .join(&returning_df, join_cols, join_cols, join_args.clone())?
         .join(&fumbling_df, join_cols, join_cols, join_args.clone())?;
-    println!("{} total players with fantasy points", merged_df.height());
+    log::debug!("{} total players with fantasy points", merged_df.height());
 
     // Perform fantasy point calculations
     let fantasy_df = merged_df
@@ -247,7 +273,7 @@ fn scoring_cols(scoring: Scoring) -> Expr {
         // couldn't just pick standard scoring when starting
         // a game with a bunch of family that hasn't played FF before.
         // A true jerk move. There, I said it.
-                
+
         // Passing bonuses
         + col("passing_50yd_td").fill_null(lit(0.0)) * lit(scoring.passing_td_50yd_bonus)
         + when(col("passing_yards").gt(lit(300.0)))

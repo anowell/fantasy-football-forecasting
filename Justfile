@@ -1,9 +1,12 @@
 set dotenv-load
 
+
+run *args:
+    cargo run -p fff-cli --bin fff -- {{args}}
+
 replacement := "read_parquet('play_by_play_2023.parquet')"
 # Query with polars. Example: just query "select * from plays limit 1" -o json | jq '.'
 query query *args:
-    echo $FMT_TABLE_FORMATTING
     polars -c "{{ replace(query, 'plays', replacement)}}" {{args}}
 
 # Download play-by-play data
