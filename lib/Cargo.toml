@@ -5,7 +5,10 @@ edition = "2021"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
-polars = { version = "0.41.0", features = ["parquet", "sql", "lazy"] }
+polars = { version = "0.41.0", features = ["parquet", "sql", "lazy", "is_first_distinct", "is_between"] }
 itertools = "0.13.0"
 thiserror = "1.0.63"
 log = "0.4.22"
+parse-display = "0.10.0"
+# derive_more = { version = "1.0.0", features = ["full"] }
+derive_deref = "1.1.1"

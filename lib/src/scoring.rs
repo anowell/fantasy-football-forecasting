@@ -1,15 +1,7 @@
-use crate::error::Error;
+use crate::roster::RosterDf;
 use crate::Result;
+use derive_deref::Deref;
 use polars::prelude::*;
-use polars::sql::SQLContext;
-
-// #[derive(Debug, Clone)]
-// pub struct PlayerFantasyStats {
-//     pub team: String,
-//     pub player_name: String,
-//     pub player_id: String,
-//     pub fantasy_points: f64,
-// }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Scoring {
@@ -88,8 +80,9 @@ impl Scoring {
     }
 }
 
-static PASSING_QUERY: &str = r#"
+pub(crate) static PASSING_QUERY: &str = r#"
     SELECT 
+        game_id,
         posteam as team,
         passer_player_id as player_id,
         passer_player_name as player_name,
@@ -99,11 +92,12 @@ static PASSING_QUERY: &str = r#"
         SUM(CASE WHEN passing_yards > 50 THEN pass_touchdown ELSE 0 END) as passing_50yd_td
     FROM plays
     WHERE passer_player_name IS NOT NULL
-    GROUP BY posteam, passer_player_id, passer_player_name
+    GROUP BY game_id, posteam, passer_player_id, passer_player_name
 "#;
 
-static RECEIVING_QUERY: &str = r#"
-    SELECT 
+pub(crate) static RECEIVING_QUERY: &str = r#"
+    SELECT
+        game_id,
         posteam as team,
         receiver_player_id as player_id,
         receiver_player_name as player_name,
@@ -114,11 +108,12 @@ static RECEIVING_QUERY: &str = r#"
         SUM(CASE WHEN receiving_yards > 50 THEN pass_touchdown ELSE 0 END) as receiving_50yd_td
     FROM plays
     WHERE receiver_player_name IS NOT NULL
-    GROUP BY posteam, receiver_player_id, receiver_player_name
+    GROUP BY game_id, posteam, receiver_player_id, receiver_player_name
 "#;
 
-static RUSHING_QUERY: &str = r#"
-    SELECT 
+pub(crate) static RUSHING_QUERY: &str = r#"
+    SELECT
+        game_id,
         posteam as team,
         rusher_player_id as player_id,
         rusher_player_name as player_name,
@@ -128,22 +123,24 @@ static RUSHING_QUERY: &str = r#"
         SUM(CASE WHEN rushing_yards > 50 THEN rush_touchdown ELSE 0 END) as rushing_50yd_td
     FROM plays
     WHERE rusher_player_name IS NOT NULL
-    GROUP BY posteam, rusher_player_id, rusher_player_name
+    GROUP BY game_id, posteam, rusher_player_id, rusher_player_name
 "#;
 
-static FUMBLING_QUERY: &str = r#"
-    SELECT 
+pub(crate) static FUMBLING_QUERY: &str = r#"
+    SELECT
+        game_id,
         posteam as team,
         fumbled_1_player_id as player_id,
         fumbled_1_player_name as player_name,
         SUM(fumble_lost) as fumbles_lost
     FROM plays
     WHERE fumbled_1_player_name IS NOT NULL
-    GROUP BY posteam, fumbled_1_player_id, fumbled_1_player_name
+    GROUP BY game_id, posteam, fumbled_1_player_id, fumbled_1_player_name
 "#;
 
-static KICKING_QUERY: &str = r#"
-    SELECT 
+pub(crate) static KICKING_QUERY: &str = r#"
+    SELECT
+        game_id,
         posteam as team,
         kicker_player_id as player_id,
         kicker_player_name as player_name,
@@ -153,17 +150,19 @@ static KICKING_QUERY: &str = r#"
         SUM(CASE WHEN kick_distance >= 50 AND field_goal_result = 'made' THEN 1 ELSE 0 END) as fg_50plus_made
     FROM plays
     WHERE play_type != 'kickoff' AND kicker_player_name IS NOT NULL
-    GROUP BY posteam, kicker_player_id, kicker_player_name
+    GROUP BY game_id, posteam, kicker_player_id, kicker_player_name
 "#;
 
-static RETURNING_QUERY: &str = r#"
-    SELECT 
+pub(crate) static RETURNING_QUERY: &str = r#"
+    SELECT
+        game_id,
         team,
         player_id,
         player_name,
         SUM(return_touchdown) as td_returns
     FROM (
         SELECT 
+            game_id,
             posteam as team,
             COALESCE(
                 lateral_kickoff_returner_player_id, 
@@ -181,75 +180,79 @@ static RETURNING_QUERY: &str = r#"
         FROM plays
         WHERE return_touchdown = 1.0
     ) as coalesced_players
-    GROUP BY team, player_id, player_name
+    GROUP BY game_id, team, player_id, player_name
 "#;
 
-pub fn assert_single_game_id(df: &DataFrame) -> Result<()> {
-    // Get the unique values in the `game_id` column
-    let unique_game_ids = df
-        .column("game_id")
-        .unwrap()
-        // .utf8()
-        // .unwrap()
-        .unique()
-        .unwrap();
+#[derive(Clone, Deref)]
+pub struct FantasyStatsDf(DataFrame);
 
-    // Check the number of unique values
-    let unique_count = unique_game_ids.len();
-
-    if unique_count == 1 {
-        // If exactly one unique value is found, return Ok
-        Ok(())
-    } else {
-        // Otherwise, return an Err with the found game_ids
-        let game_ids: Vec<String> = unique_game_ids.iter().map(|s| s.to_string()).collect();
-        Err(Error::NotASingleGame(game_ids))
+impl FantasyStatsDf {
+    pub(crate) fn new(df: DataFrame) -> Self {
+        Self(df)
     }
-}
 
-pub fn score_game(df: DataFrame, scoring: Scoring) -> Result<DataFrame> {
-    // Scoring math runs on a single game
-    assert_single_game_id(&df)?;
+    pub fn filter(self, filter: Expr) -> Result<Self> {
+        let df = self.0.lazy().filter(filter).collect()?;
+        Ok(Self(df))
+    }
 
-    let mut ctx = SQLContext::new();
-    ctx.register("plays", df.lazy());
+    pub fn merge_roster(&self, roster_df: RosterDf) -> Result<FantasyStatsDf> {
+        let join_args = JoinArgs::new(JoinType::Inner).with_coalesce(JoinCoalesce::CoalesceColumns);
+        let merged_df = self.join(&roster_df, ["player_id"], ["gsis_id"], join_args)?;
 
-    let passing_df = ctx.execute(PASSING_QUERY)?.collect()?;
-    log::debug!("{} passers with fantasy points", passing_df.height());
-    let receiving_df = ctx.execute(RECEIVING_QUERY)?.collect()?;
-    log::debug!("{} receivers with fantasy points", receiving_df.height());
-    let rushing_df = ctx.execute(RUSHING_QUERY)?.collect()?;
-    log::debug!("{} rushers with fantasy points", rushing_df.height());
-    let fumbling_df = ctx.execute(FUMBLING_QUERY)?.collect()?;
-    log::debug!("{} fumblers with fantasy points", fumbling_df.height());
-    let kicking_df = ctx.execute(KICKING_QUERY)?.collect()?;
-    log::debug!("{} kickers with fantasy points", kicking_df.height());
-    let returning_df = ctx.execute(RETURNING_QUERY)?.collect()?;
-    log::debug!("{} returners with fantasy points", returning_df.height());
+        log::debug!("{} total players with fantasy points", merged_df.height());
+        Ok(Self(merged_df))
+    }
 
-    // Merge the DataFrames on team, player_id, and player_name
-    let join_cols = ["team", "player_id", "player_name"];
-    let join_args = JoinArgs::new(JoinType::Full).with_coalesce(JoinCoalesce::CoalesceColumns);
-    let merged_df = passing_df
-        .join(&receiving_df, join_cols, join_cols, join_args.clone())?
-        .join(&rushing_df, join_cols, join_cols, join_args.clone())?
-        .join(&passing_df, join_cols, join_cols, join_args.clone())?
-        .join(&kicking_df, join_cols, join_cols, join_args.clone())?
-        .join(&returning_df, join_cols, join_cols, join_args.clone())?
-        .join(&fumbling_df, join_cols, join_cols, join_args.clone())?;
-    log::debug!("{} total players with fantasy points", merged_df.height());
+    /// Takes player fantasy stats dataframe and calculates fantasy score
+    fn score_lazy(self, scoring: Scoring) -> Result<LazyFrame> {
+        let fantasy_df = self
+            .0
+            .lazy()
+            .with_column(scoring_cols(scoring).alias("fantasy_points"));
+        Ok(fantasy_df)
+    }
 
-    // Perform fantasy point calculations
-    let fantasy_df = merged_df
-        .lazy()
-        .with_column(scoring_cols(scoring).alias("fantasy_points"))
-        .sort(
-            ["fantasy_points"],
-            SortMultipleOptions::default().with_order_descending(true),
-        )
-        .collect()?;
+    pub fn score(self, scoring: Scoring) -> Result<DataFrame> {
+        let df = self
+            .score_lazy(scoring)?
+            .sort(
+                ["fantasy_points"],
+                SortMultipleOptions::default().with_order_descending(true),
+            )
+            .collect()?;
+        Ok(df)
+    }
 
-    Ok(fantasy_df)
+    pub fn score_by_player(self, scoring: Scoring) -> Result<DataFrame> {
+        let lf = self.score_lazy(scoring)?;
+        let df = lf
+            .group_by(&[col("player_id")])
+            .agg([
+                col("fantasy_points").sum(),
+                cols(["player_name", "team"]).first(),
+            ])
+            .sort(
+                ["fantasy_points"],
+                SortMultipleOptions::default().with_order_descending(true),
+            )
+            .collect()?;
+        Ok(df)
+    }
+
+    // ScoreBy::Game => &["game_id", "week", "team", "fantasy_points"],
+    pub fn score_by_game(self, scoring: Scoring) -> Result<DataFrame> {
+        let lf = self.score_lazy(scoring)?;
+        let df = lf
+            .group_by(&[col("game_id")])
+            .agg([col("fantasy_points").sum(), cols(["week", "team"]).first()])
+            .sort(
+                ["fantasy_points"],
+                SortMultipleOptions::default().with_order_descending(true),
+            )
+            .collect()?;
+        Ok(df)
+    }
 }
 
 fn scoring_cols(scoring: Scoring) -> Expr {

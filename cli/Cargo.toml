@@ -15,4 +15,5 @@ itertools = "0.13.0"
 clap = { version = "4.5.15", features = ["derive"] }
 fff = { path = "../lib" }
 log = "0.4.22"
+parse-display = "0.10.0"
 simplelog = "0.12.2"
